@@ -17,6 +17,8 @@ It does not work in mobile, Or any other platform other than directX, nor does i
   * **ReShade** - Possibly
 # Usage
 * Install like one would install a 3d migoto shader into Roblox Studio
+# Credits
+* Atmosphere shader paper: Luke Campbell via Panovtest.com
 # Licenses
 * DONOT REDISTRIBUTE WITHOUT OPENSOURCING
 * DONOT REDISTRIBUTE PRECOMPILED
