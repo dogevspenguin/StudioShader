@@ -1,0 +1,7 @@
+# Treat all text files as HLSL
+*.txt linguist-language=HLSL
+
+# OR, if you want to be more specific to just the replacement shaders:
+*-ps_replace.txt linguist-language=HLSL
+*-vs_replace.txt linguist-language=HLSL
+*-cs_replace.txt linguist-language=HLSL
