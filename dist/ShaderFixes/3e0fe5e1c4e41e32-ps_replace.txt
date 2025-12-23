@@ -79,7 +79,10 @@ cbuffer CB5 : register(b5)
         float4 DetailScale;
     } CB5 : packoffset(c0);
 }
-
+// Define the special parameter texture on slot 125
+// Change StructuredBuffer to just Buffer
+// Change Buffer<float4> to Buffer<float>
+Buffer<float> TimeBuffer : register(t120);
 SamplerState CloudsSampler_s : register(s0);
 Texture2D<float4> CloudsTexture : register(t0);
 SamplerState sampler3_s : register(s3);
@@ -165,14 +168,15 @@ float2 IntersectCloudLayer(float3 ro, float3 rd, float hBot, float hTop) {
 float GetDensity(float3 pos, float cloudBottom, float cloudThickness, float noiseScale, float3 windUV) {
     // Apply wind offset directly to the UVs.
     // 1.0 in 'windUV' = 1 Full Cycle of noise, matching the game's texture scroll behavior.
-    float2 uv = pos.xz * noiseScale + windUV.xz;
+ 
+    float2 uv = (pos.xz) * noiseScale + windUV.xz;
 
     float noiseVal = fbm(uv);
     float heightRatio = (pos.y - cloudBottom) / (cloudThickness);
     float heightMask = 4.0 * heightRatio * (1.0 - heightRatio);
     heightMask = saturate(heightMask);
     // Also apply wind to the 3D erosion noise so the details move with the cloud
-    float skib = fbm3d(pos / 1000 + windUV) * 0.5;
+    float skib = fbm3d(pos / 1000) * 0.5;
     return noiseVal * (heightMask - skib * heightMask);
 }
 
@@ -213,6 +217,7 @@ void main(
      float2 screenUV = v0.xy * CB0.invViewportWH;
     // UPDATED: Match the 0.1 constant from user data
     int3 pixelCoord = int3(v0.xy, 0);
+    float Bob = TimeBuffer.Load(0); 
     float hwDepth = GlobalDepth.Sample(CloudsSampler_s, screenUV*1).x;//GlobalDepth.Load(pixelCoord).r;
     // Uncomment this to check if depth is loading.
 // If screen is BLACK: Texture is empty (Unbind failed).
@@ -282,7 +287,7 @@ void main(
         float transmittance = 1.0;
 
         float noiseScale = 0.0001;
-        float3 windUV = CB5.DirDist.xyz;
+        float3 windUV = Bob/100;//CB5.DirDist.xyz;
 
         sunDir = -normalize(CB0.Lamp0Dir.xyz);
         float3 sunColor = CB0.Lamp0Color.xyz;
@@ -447,6 +452,7 @@ void main(
     //fogFactor = pow(fogFactor, 1.5); // Exponential fog looks more natural
 
     // 5. Apply Fog to Color ONLY (Alpha stays intact)
+    //if (Bob > 0.0) { rawCloudColor = float3(1, 0, 0); }
     float4 sampledSkyColor = SkyColor.Sample(CloudsSampler_s, screenUV*1);
     o0.xyz =rawCloudColor;//lerp(rawCloudColor, sampledSkyColor.xyz ,fogFactor);
     o0.w = finalAlpha; // Keep alpha based on cloud density, NOT distance
@@ -455,4 +461,5 @@ void main(
 
     // Convert Linear Depth back to Buffer Depth
     oDepth = DEPTH_CONTROL / (outputLinearDepth + 0.000001);
+    //o0 = float4(min((1/oDepth)/5000,0.8),min((1/oDepth)/5000,0.8),min((1/oDepth)/5000,0.8),1.0);
 }
