@@ -16,7 +16,11 @@ It does not work in mobile, Or any other platform other than directX, nor does i
   * **Roblox terrain** - Destroy Physically Based Clouds
   * **ReShade** - Possibly
 # Usage
-* Install like one would install a 3d migoto shader into Roblox Studio
+* Download 3d migoto from [https://github.com/bo3b/3Dmigoto/releases]()
+* Unzip the X64 folder's content into the folder containing robloxstudio.exe
+* Unzip the file from this respitory into the folder containing robloxstudio.exe
+* Replace 3dmigoto default dx3.ini with a custom one from the zip file in releases
+* Replace shaderfixes folder with the one from the zip file in releases
 # Credits
 * Atmosphere shader paper: Luke Campbell via [Panovtest.com](https://panoptesv.com/SciFi/ColorsOfAlienWorlds/AlienFields.php)
 # Licenses
