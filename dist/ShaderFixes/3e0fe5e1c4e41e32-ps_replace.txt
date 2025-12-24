@@ -410,7 +410,7 @@ void main(
             }
 
             t += marchStep;
-            marchStep *= 1.01;
+            marchStep *= 1.005;
         }
 
         finalAlpha = 1-transmittance;
