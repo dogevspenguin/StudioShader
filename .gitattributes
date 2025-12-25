@@ -1,4 +1,5 @@
 # Treat all text files as HLSL
+dist/** linguist-detectable
 *.txt linguist-detectable=true
 *.txt linguist-language=HLSL
 
