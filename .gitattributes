@@ -2,6 +2,8 @@
 
 *.txt linguist-detectable=true
 *.txt linguist-language=HLSL
+*.txt linguist-generated=false
+*.ini linguist-generated=false
 d3dx.ini linguist-vendored=false
 d3dx.ini linguist-detectable
 
