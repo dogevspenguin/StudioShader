@@ -1,6 +1,8 @@
 // --- MultiScatCS.hlsl ---
 RWBuffer<float4> MultiScatBuffer : register(u0);
 
+
+
 static const float PI = 3.14159265359;
 static const float R_PLANET = 6360000.0;
 static const float R_ATM = 6460000.0;
@@ -100,4 +102,5 @@ void main(uint3 id : SV_DispatchThreadID) {
     float3 Psi_ms = L_2nd * F_ms;
 
     MultiScatBuffer[bufferIndex] = float4(Psi_ms, 1.0);
+
 }
