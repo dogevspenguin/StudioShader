@@ -1,0 +1,412 @@
+// ---- Created with 3Dmigoto v1.3.16 ----
+// Custom Atmosphere Shader - Unit Corrected (1m = 3.048 units)
+
+cbuffer CB0 : register(b0)
+{
+  struct
+  {
+    row_major float4x4 ViewProjection[2];
+    float4 ViewRight;
+    float4 ViewUp;
+    float4 ViewDir;
+    float3 CameraPosition[2];
+    float3 AmbientColor;
+    float4 SkyAmbient;
+    float3 Lamp0Color; // PRIMARY LIGHT
+    float3 Lamp0Dir;
+    float3 Lamp1Color;
+    float4 FogParams;
+    float4 FogColor_GlobalForceFieldTime;
+    float4 Exposure_DoFDistance;
+    float4 LightConfig0;
+    float4 LightConfig1;
+    float4 LightConfig2;
+    float4 LightConfig3;
+    float4 ShadowMatrix0;
+    float4 ShadowMatrix1;
+    float4 ShadowMatrix2;
+    float4 RefractionBias_FadeDistance_GlowFactor_Free;
+    float4 TextureData_ShadowInfo;
+    float4 SkyGradientTop_EnvDiffuse;
+    float4 SkyGradientBottom_EnvSpec;
+    float4 AmbientColorNoIBL_CubeBlend;
+    float4 SkyAmbientNoIBL;
+    float4 AmbientCube[12];
+    float4 CascadeSphere0;
+    float4 CascadeSphere1;
+    float4 CascadeSphere2;
+    float4 CascadeSphere3;
+    float2 invViewportWH;
+    float2 viewportScale;
+    float debugAuthLodMode;
+    float padding;
+    float hqDist;
+    float localLightDist;
+    float sunDist;
+    float hybridLerpSlope;
+    float evsmPosExp;
+    float evsmNegExp;
+    float globalShadow;
+    float shadowBias;
+    float packedAlphaRef;
+    float debugFlags;
+    row_major float4x4 FroxelTransform;
+    float4 SkyboxRotation0;
+    float4 SkyboxRotation1;
+    float4 SkyboxRotation2;
+  } CB0 : packoffset(c0);
+}
+
+cbuffer CB4 : register(b4)
+{
+  struct
+  {
+    float4 FoV;
+    float2 shearOffset;
+    float2 pad;
+  } CB4 : packoffset(c0);
+}
+
+SamplerState DiffuseMapSampler_s : register(s0);
+Texture2D<float4> DiffuseMapTexture : register(t0);
+Buffer<float4> MultiScatBuffer : register(t120);
+// --------------------------------------------------------------------------
+// TUNED CONSTANTS (Units: 1 meter = 3.048 game units)
+// --------------------------------------------------------------------------
+static const float scale = 3.28084; 
+static const float PI = 3.14159265359;
+
+// GEOMETRY (In Game Units)
+static const float R_PLANET = 6360000.0 * scale;
+static const float R_ATM = 6460000.0 * scale;
+
+// SCALE HEIGHTS (Converted to Game Units so the atmosphere isn't "compressed")
+static const float H_RAYLEIGH = 8000.0 * scale; 
+static const float H_MIE = 1200.0 * scale;
+
+// BASE COEFFICIENTS (Physically based, per meter)
+// We do NOT multiply these by scale. We convert the distance to meters instead.
+static const float facr = 1;
+static const float3 BETA_R_SCAT = float3(5.8e-6, 1.35e-5, 3.31e-5)*facr; 
+static const float fac = 10;
+static const float3 BETA_M_SCAT = float3(4.0e-7, 4.0e-7, 4.0e-7)*fac;
+// Extinction should be close to scattering
+static const float3 BETA_M_EXT  = float3(4.4e-7, 4.4e-7, 4.4e-7)*fac;
+static const float3 BETA_ABS_OZONE = float3(6.50e-7, 1.881e-6, 8.5e-8);
+
+// --------------------------------------------------------------------------
+// HELPER FUNCTIONS
+// --------------------------------------------------------------------------
+
+float InterleavedGradientNoise(float2 uv) {
+    float3 magic = float3(0.06711056, 0.00583715, 52.9829189);
+    return frac(magic.z * frac(dot(uv, magic.xy)));
+}
+// Helper: Manual Bilinear Interpolation for Buffer
+float3 GetMultiScattering(float3 p, float3 sunDir) {
+    float h = length(p) - R_PLANET;
+    float cosSun = dot(normalize(p), sunDir);
+    
+    // 1. Calculate UVs
+    float u = 0.5 + 0.5 * cosSun;
+    float v = h / (R_ATM - R_PLANET);
+    v = saturate(v);
+
+    // 2. Bilinear Coordinates
+    float width = 128.0;
+    float height = 128.0;
+    
+    // Convert 0..1 to 0..31 pixel coordinates
+    float x = u * width - 0.5;
+    float y = v * height - 0.5;
+    
+    // Find the 4 nearest pixels (x0, y0) to (x1, y1)
+    int x0 = int(floor(x));
+    int y0 = int(floor(y));
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+    
+    // Calculate weights (how close are we to the next pixel?)
+    float wx = frac(x);
+    float wy = frac(y);
+    
+    // Clamp indices to buffer size (0 to 63)
+    x0 = clamp(x0, 0, 127); x1 = clamp(x1, 0, 127);
+    y0 = clamp(y0, 0, 127); y1 = clamp(y1, 0, 127);
+    
+    // 3. Sample 4 Neighbors
+    float3 val00 = MultiScatBuffer.Load(y0 * 128 + x0).rgb; // Top-Left
+    float3 val10 = MultiScatBuffer.Load(y0 * 128 + x1).rgb; // Top-Right
+    float3 val01 = MultiScatBuffer.Load(y1 * 128 + x0).rgb; // Bottom-Left
+    float3 val11 = MultiScatBuffer.Load(y1 * 128 + x1).rgb; // Bottom-Right
+    
+    // 4. Interpolate
+    float3 top = lerp(val00, val10, wx);
+    float3 bot = lerp(val01, val11, wx);
+    return lerp(top, bot, wy);
+}
+float2 ResolveSphereIntersection(float3 rayOrigin, float3 rayDir, float sphereRadius) {
+    float a = dot(rayDir, rayDir);
+    float b = 2.0 * dot(rayDir, rayOrigin);
+    float c = dot(rayOrigin, rayOrigin) - (sphereRadius * sphereRadius);
+    float d = b * b - 4.0 * a * c;
+
+    if (d < 0.0) return float2(-1.0, -1.0);
+    float sqrtD = sqrt(d);
+    return float2((-b - sqrtD) / (2.0 * a), (-b + sqrtD) / (2.0 * a));
+}
+
+float PhaseRayleigh(float cosTheta) {
+    return (3.0 / (16.0 * PI)) * (1.0 + cosTheta * cosTheta);
+}
+
+float PhaseMie(float cosTheta) {
+    float a = 1.5;
+    float gamma = acos(clamp(cosTheta, -1.0, 1.0));
+    float num = 2.0 * (1.0 + a * a);
+    float den = 2.0 * PI * (1.0 + exp(-a * PI));
+    float term1 = (1.0 - exp(-a * PI * 0.5)) * exp(-a * gamma);
+    float term2 = exp(-a * PI * 0.5) * exp(-a * (PI - gamma));
+    return (num / den) * (term1 + term2);
+}
+float Bayer4(float2 uv) {
+    int2 i = int2(uv);
+    
+    // Mix bits to compute the 4x4 pattern index
+    // This is a bitwise representation of the standard Bayer matrix
+    int val = 
+        (((i.y & 1) ^ (i.y >> 1 & 1)) << 2 | ((i.x & 1) ^ (i.x >> 1 & 1))) + 
+        ((((i.y & 2) ^ (i.y >> 1 & 2)) << 2 | ((i.x & 2) ^ (i.x >> 1 & 2))) << 2);
+        
+    return float(val) / 16.0;
+}
+float2 GetOpticalDepth(float3 p, float3 lightDir) {
+    // Self-Shadowing
+    float2 planetIntersect = ResolveSphereIntersection(p, lightDir, R_PLANET);
+    if (planetIntersect.y > 0.0) return float2(1e9, 1e9); 
+
+    float2 intersect = ResolveSphereIntersection(p, lightDir, R_ATM);
+    float distToSpace = intersect.y; // This is in Game Units
+    
+    if (distToSpace < 0.0) return float2(0,0);
+
+    int steps = 4;
+    float stepSize = distToSpace / float(steps);
+    
+    // UNIT FIX 1: Convert step size from Units to Meters for the integration
+    float stepSizeMeters = stepSize / scale; 
+
+    float odR = 0.0;
+    float odM = 0.0;
+
+    for(int i = 0; i < steps; i++) {
+        float3 curr = p + lightDir * (float(i) * stepSize + 0.5 * stepSize);
+        float h = max(0.0, length(curr) - R_PLANET); // Altitude in Units
+        
+        // UNIT FIX 2: h is Units, H_RAYLEIGH is Units. The ratio is correct.
+        odR += exp(-h / H_RAYLEIGH) * stepSizeMeters;
+        odM += exp(-h / H_MIE) * stepSizeMeters;
+    }
+    return float2(odR, odM);
+}
+
+// --------------------------------------------------------------------------
+// MAIN SHADER
+// --------------------------------------------------------------------------
+void main(
+  float4 v0 : SV_Position0,
+  float2 v1 : TEXCOORD0,
+  float4 v2 : COLOR0,
+  out float4 o0 : SV_Target0)
+{
+    // --- 1. RAY RECONSTRUCTION ---
+    float4 r0;
+    float3 r1;
+    r0.xy = float2(0.5, 0.5) * v0.xy;
+    r0.xy = r0.xy / CB0.viewportScale.xy;
+    r0.zw = r0.xy * CB4.FoV.xy + float2(-1, -1);
+    r0.zw = CB4.FoV.zw * r0.zw + CB4.shearOffset.xy;
+    r1.xyz = CB0.ViewUp.xyz * r0.www;
+    r1.xyz = r0.zzz * CB0.ViewRight.xyz + -r1.xyz;
+    r1.xyz = -CB0.ViewDir.xyz + r1.xyz;
+    float3 viewDir = normalize(r1);
+
+    // --- 2. SETUP LIGHTS & SUN/MOON DISCRIMINATION ---
+    float3 sunDir = -normalize(CB0.Lamp0Dir.xyz);
+    float lampBrightness = length(CB0.Lamp0Color.xyz);
+    
+    bool isHighAltitude = sunDir.y > 0.2; 
+    bool isDimLight = lampBrightness < 2.0;
+    
+    float3 sunIntensity;
+
+    if (isDimLight && isHighAltitude) {
+        // Night / Moon -> Black
+        sunIntensity = float3(0.0, 0.0, 0.0);
+    } 
+    else {
+        // Day / Sunset -> Bright
+        sunIntensity = float3(20.0, 20.0, 20.0);
+    }
+    
+    // --- 3. DYNAMIC EXTINCTION ---
+    float sunHeight = saturate(sunDir.y);
+    float betaMult = lerp(1.0, 0.0, smoothstep(0.0, 0.15, sunHeight));
+    float3 BETA_R_EXT = BETA_R_SCAT;
+
+    // --- 4. SCENE SETUP ---
+    float camAltitude = max(10.0, CB0.CameraPosition[0].y);
+    float3 startPos = float3(0, R_PLANET + camAltitude, 0);
+
+    float2 atmHit = ResolveSphereIntersection(startPos, viewDir, R_ATM);
+    float2 planetHit = ResolveSphereIntersection(startPos, viewDir, R_PLANET);
+
+    float marchStart = 0.0;
+    float marchEnd = atmHit.y;
+    
+    bool inSpace = camAltitude > (R_ATM - R_PLANET);
+    float3 originalC = float3(0,0,0);
+    float3 groundC = float3(6.0/255.0, 66.0/255.0, 115.0/255.0);
+    if (inSpace) {
+        if (atmHit.x < 0.0 && atmHit.y < 0.0) {
+            float cosSun = dot(viewDir, sunDir);
+            float sunDisk = smoothstep(0.9998, 0.99995, cosSun);
+            o0 = float4(sunIntensity * sunDisk, 1.0);
+            return;
+        }
+        marchStart = atmHit.x;
+        marchEnd = atmHit.y;
+    }
+
+    if (planetHit.x > 0.0) {
+        marchEnd = planetHit.x;
+        
+        // --- 1. Calculate Surface Position & Normal ---
+        // We know where the ray hit the planet, so we calculate that 3D point.
+        // Since the planet is centered at (0,0,0), the normal is just the normalized position.
+        float3 surfacePos = startPos + viewDir * planetHit.x;
+        float3 surfaceNormal = normalize(surfacePos);
+
+        // --- 2. Calculate Lighting Angle (N dot L) ---
+        // This makes the side facing the sun bright, and the side facing away dark.
+        float NdotL = max(0.0, dot(surfaceNormal, sunDir));
+
+        // --- 3. Calculate Sun Color Reaching Surface ---
+        // The sun light has to travel through the atmosphere to get to the ground.
+        // We calculate that attenuation here so the ground turns orange/red at sunset.
+        float2 odSunToSurface = GetOpticalDepth(surfacePos, sunDir);
+        float3 sunLightAtGround = sunIntensity * exp(-(BETA_R_EXT * odSunToSurface.x + BETA_M_EXT * odSunToSurface.y));
+
+        // --- 4. Combine ---
+        // Albedo (Color) * LightColor * Angle
+        originalC = groundC * sunLightAtGround * NdotL;
+    }
+    
+    if (marchEnd < marchStart) {
+        o0 = float4(0,0,0,1);
+        return;
+    }
+
+    // --- 5. RAY MARCHING ---
+    int numSteps = 16;
+    float stepSize = (marchEnd - marchStart) / float(numSteps);
+    float stepSizeMeters = stepSize / scale; // Unit correction
+
+    float3 totalRayleighSun = float3(0,0,0);
+    float3 totalMieSun = float3(0,0,0);
+    float3 totalMultiScat = float3(0,0,0); // <--- NEW ACCUMULATOR
+
+    float odR_View = 0.0;
+    float odM_View = 0.0;
+    float odO_View = 0.0;
+
+    // Dithering (Optional)
+    float ditherVal = InterleavedGradientNoise(v0.xy);
+
+    for (int i = 0; i < numSteps; i++) {
+        float dist = marchStart + float(i) * stepSize + 0.5 * stepSize;
+        float3 p = startPos + viewDir * (dist + stepSize * ditherVal * 0.0);
+        float h = max(0.0, length(p) - R_PLANET);
+        float ozoneDensity = max(0.0, 1.0 - abs(h - 25000.0) / 15000.0);
+        // 1. Density at current height
+        // 'hr' and 'hm' are optical depth *steps* (Density * StepSize)
+        float hr = exp(-h / H_RAYLEIGH) * stepSizeMeters;
+        float hm = exp(-h / H_MIE) * stepSizeMeters;
+        float ho = ozoneDensity*stepSizeMeters;
+        // 2. Accumulate Optical Depth to Camera
+        odR_View += hr;
+        odM_View += hm;
+        odO_View += ho;
+		
+        
+        // 3. Transmittance from Camera to Current Point
+        // We need this for BOTH Single and Multiple scattering
+        float3 tauView = BETA_R_EXT * odR_View + BETA_M_EXT * odM_View + BETA_ABS_OZONE * odO_View;
+        float3 T_View = exp(-tauView);
+
+        // --- SINGLE SCATTERING (Sun Light) ---
+        float2 odSun = GetOpticalDepth(p, sunDir);
+        float shadowSun = (odSun.x > 1e8) ? 0.0 : 1.0;
+        
+        if (shadowSun > 0.0) {
+            // Transmittance from Sun to Point
+            float3 T_Sun = exp(-(BETA_R_EXT * odSun.x + BETA_M_EXT * odSun.y));
+            
+            // Light reaching camera = Density * T_Sun * T_View
+            // (Phase function is applied outside loop for optimization)
+            totalRayleighSun += hr * T_Sun * T_View;
+            totalMieSun      += hm * T_Sun * T_View;
+        }
+
+        // --- MULTIPLE SCATTERING (Ambient Glow) ---
+        // Sample the LUT
+        float3 Psi_ms = GetMultiScattering(p, sunDir);
+        
+        // Calculate Scattering Coefficient * StepSize
+        // We reuse hr/hm which are (Density * Step). 
+        // We just need to multiply by the Scattering Coefficients (BETA_R_SCAT).
+        float3 scatCoeffStep = (BETA_R_SCAT * hr) + (BETA_M_SCAT * hm);
+        
+        // Accumulate: Scattering * PSI * TransmittanceToView
+        // Note: Psi_ms already represents the infinite bounce energy at point 'p'.
+        // We just need to scatter it towards the camera (scatCoeff) and fade it (T_View).
+        totalMultiScat += scatCoeffStep * Psi_ms * T_View;
+    }
+
+    // --- 6. PHASE & COMBINATION ---
+    float cosThetaSun = dot(viewDir, sunDir);
+    float pR_Sun = PhaseRayleigh(cosThetaSun);
+    float pM_Sun = PhaseMie(cosThetaSun);
+
+    // 1. Calculate Single Scattering (Directional)
+    // sunIntensity * (RayleighPart * PhaseR + MiePart * PhaseM)
+    float3 singleScat = sunIntensity * (totalRayleighSun * BETA_R_SCAT * pR_Sun + totalMieSun * BETA_M_SCAT * pM_Sun);
+
+    // 2. Calculate Multiple Scattering (Isotropic)
+    // Just multiply by sun intensity (Psi_ms is normalized to input 1.0)
+    float3 multiScat = sunIntensity * totalMultiScat;
+
+    // 3. Combine
+    float3 atmSun = multiScat+singleScat;
+
+    // --- 7. DISK RENDERING ---
+    float sunDiskVal = smoothstep(0.9998, 0.99995, cosThetaSun);
+    
+    // FIX: Use viewDir instead of sunDir. 
+    // This checks if the specific pixel we are drawing is blocked by the planet 
+    // or how deep inside the atmosphere it is.
+    float2 camToSunOD = GetOpticalDepth(startPos, viewDir); 
+    
+    float3 sunExtinction = exp(-(BETA_R_EXT * camToSunOD.x + BETA_M_EXT * camToSunOD.y));
+    float3 sunColor = sunIntensity * sunDiskVal * sunExtinction * 10.0;
+    float3 totalExtinction = BETA_R_EXT * odR_View + BETA_M_EXT * odM_View;
+    float3 ogcolT = exp(-totalExtinction);
+    float3 finalColor = atmSun + sunColor  ;
+
+    // --- 8. TONE MAPPING ---
+    float exposure = max(0.2, CB0.Exposure_DoFDistance.y);
+    float3 col = finalColor * (exposure/2);
+    col = col / (1.0 + col);
+    o0.xyz = pow(saturate(col), 1.0/2.2); 
+    o0.w = 1.0;
+}
