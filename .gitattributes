@@ -2,7 +2,7 @@
 
 *.txt linguist-detectable=true
 *.txt linguist-language=HLSL
-d3dx.ini** linguist-vendored=false
-d3dx.ini** linguist-detectable
+d3dx.ini linguist-vendored=false
+d3dx.ini linguist-detectable
 
 
