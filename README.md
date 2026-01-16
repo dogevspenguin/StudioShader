@@ -1,6 +1,21 @@
-# Roblox Studio Cloud and Atmosphere Shaders (CHECK GUIDE)
-![Static Badge](https://img.shields.io/badge/license-%20%20GNU%20GPLv3%20-green?style=plastic)
-![Skies](https://github.com/dogevspenguin/StudioShader/blob/main/images/main.png)
+<div align="center">
+
+  <h1>Skibidi's Roblox Studio Cloud and Atmosphere Shaders (CHECK GUIDE)</h1>
+
+  <p>
+    <img src="https://img.shields.io/badge/license-%20%20GNU%20GPLv3%20-green?style=plastic" alt="License Badge" />
+     <img src="https://img.shields.io/badge/703-studio-green?logo=robloxstudio" alt="License Badge" />
+    <img src="https://img.shields.io/badge/704-studio-yellow?logo=robloxstudio" alt="License Badge" />
+  </p>
+
+  <img src="https://github.com/user-attachments/assets/aabf92b4-8b55-4e36-9763-af3e63a3716d" alt="Demonstration Image" />
+
+</div>
+<br />
+<br />
+<br />
+
+
 
 STEP TO USE: ADD 3d migoto, LOAD THE GAME, then add the shader files, then f10 to reload 3d migoto, roblox did something per update 702
 
