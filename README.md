@@ -28,6 +28,9 @@ It does not work in mobile, Or any other platform other than directX, nor does i
 * Replace shaderfixes folder with the one from the zip file in releases
 # Credits
 * Atmosphere shader paper: Luke Campbell via [Panovtest.com](https://panoptesv.com/SciFi/ColorsOfAlienWorlds/AlienFields.php)
+* Atmosphere shader paper 2: [Epic Games](https://sebh.github.io/publications/egsr2020.pdf)
+* Cloud paper: [Horizon Zero Dawn](https://www.guerrilla-games.com/read/the-real-time-volumetric-cloudscapes-of-horizon-zero-dawn)
+
 # Licenses
 * DONOT REDISTRIBUTE WITHOUT OPENSOURCING
 * DONOT REDISTRIBUTE PRECOMPILED
