@@ -1,0 +1,953 @@
+// ---- Created with 3Dmigoto v1.3.16
+// FINAL FIX: Spherical Shell (Planet) + WIND COORDINATE FIX + MOON REMOVAL + SUNSET COLORS
+
+cbuffer CB0 : register(b0)
+{
+    struct
+    {
+        row_major float4x4 ViewProjection[2];
+        float4 ViewRight;
+        float4 ViewUp;
+        float4 ViewDir;
+        float3 CameraPosition[2];
+        float3 AmbientColor;
+        float4 SkyAmbient;
+        float3 Lamp0Color;
+        float3 Lamp0Dir;
+        float3 Lamp1Color;
+        float4 FogParams;
+        float4 FogColor_GlobalForceFieldTime;
+        float4 Exposure_DoFDistance;
+        float4 LightConfig0;
+        float4 LightConfig1;
+        float4 LightConfig2;
+        float4 LightConfig3;
+        float4 ShadowMatrix0;
+        float4 ShadowMatrix1;
+        float4 ShadowMatrix2;
+        float4 RefractionBias_FadeDistance_GlowFactor_Free;
+        float4 TextureData_ShadowInfo;
+        float4 SkyGradientTop_EnvDiffuse;
+        float4 SkyGradientBottom_EnvSpec;
+        float4 AmbientColorNoIBL_CubeBlend;
+        float4 SkyAmbientNoIBL;
+        float4 AmbientCube[12];
+        float4 CascadeSphere0;
+        float4 CascadeSphere1;
+        float4 CascadeSphere2;
+        float4 CascadeSphere3;
+        float2 invViewportWH;
+        float2 viewportScale;
+        float debugAuthLodMode;
+        float padding;
+        float hqDist;
+        float localLightDist;
+        float sunDist;
+        float hybridLerpSlope;
+        float evsmPosExp;
+        float evsmNegExp;
+        float globalShadow;
+        float shadowBias;
+        float packedAlphaRef;
+        float debugFlags;
+        row_major float4x4 FroxelTransform;
+        float4 SkyboxRotation0;
+        float4 SkyboxRotation1;
+        float4 SkyboxRotation2;
+    } CB0 : packoffset(c0);
+}
+
+cbuffer CB4 : register(b4)
+{
+    struct
+    {
+        float4 FoV;
+        float2 shearOffset;
+        float2 pad;
+    } CB4 : packoffset(c0);
+}
+
+cbuffer CB5 : register(b5)
+{
+    struct
+    {
+        float4 DirDist;
+        // This contains the wind offset
+        float4 LightColorSize;
+        float4 CoverDensityQuality; // .x = Density Slider (0 to 1)
+        float4 Color;
+        float4 DetailScale;
+    } CB5 : packoffset(c0);
+}
+
+Buffer<float> TimeBuffer : register(t120);
+// MultiScat (2D)
+Buffer<float4> DebugMultiScat : register(t121);
+// OpticalDepth (3D) - NEW
+Buffer<float4> DebugOpticalDepth : register(t122);
+Buffer<float4> DebugDirect : register(t119);
+
+RWBuffer<float4> CameraInjection : register(u7);
+
+SamplerState CloudsSampler_s : register(s0);
+Texture2D<float4> CloudsTexture : register(t0);
+SamplerState sampler3_s : register(s3);
+Texture2D<float> GlobalDepth : register(t100);
+Texture2D<float4> Color : register(t118);
+Texture2D<float4> SkyColor : register(t99);
+// --- PLANETARY CONSTANTS (From baf016c3f8) ---
+// 1 meter = 3.28084 game units (feet)
+static const float SCALE_FACTOR = 3.28084*1;
+static const float R_PLANET = 6360000.0 * SCALE_FACTOR; 
+// Planet Center is below the map origin (0,0,0)
+static const float3 PLANET_CENTER = float3(0, -R_PLANET, 0);
+// --- PROCEDURAL NOISE ---
+// These are now ALTITUDES above the sphere surface
+static const float CUMULUS_BOT = (6000);
+static const float CUMULUS_TOP = (12000 + 3000);
+static const float CIRRUS_BOT = 9800 * 3;
+static const float CIRRUS_TOP = 10000.0 * 3;
+static const float R_ATM = 6460000.0 * SCALE_FACTOR;
+static const float debug = 2;
+float hash(float2 p) {
+    p = frac(p * float2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return frac(p.x * p.y);
+}
+
+float noise(float2 p) {
+    float2 i = floor(p);
+    float2 f = frac(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float res = lerp(lerp(hash(i), hash(i + float2(1.0, 0.0)), f.x),
+                     lerp(hash(i + float2(0.0, 1.0)), hash(i + float2(1.0, 1.0)), f.x), f.y);
+    return res;
+}
+
+float fbm(float2 p) {
+    float f = 0.0;
+    f += 0.5000 * noise(p);
+    p = p * 2.02;
+    f += 0.2500 * noise(p);
+    p = p * 2.03;
+    f += 0.1250 * noise(p);
+    return f;
+}
+
+// 3D Noise wrappers
+float2 hash2(float n) {
+    return frac(sin(float2(n, n + 1.0)) * float2(43758.5453, 22578.1459));
+}
+
+float noise3D(float3 p) {
+    float iz = floor(p.z);
+    float fz = frac(p.z);
+    float z_blend = fz * fz * (3.0 - 2.0 * fz);
+    float2 offset1 = hash2(iz) * 300.0;
+    float2 offset2 = hash2(iz + 1.0) * 300.0;
+    float n1 = noise(p.xy + offset1);
+    float n2 = noise(p.xy + offset2);
+    return lerp(n1, n2, z_blend);
+}
+float3 SampleBilinear(Buffer<float4> buf, float2 uv, float2 res, int zOffset) {
+    // 1. Map 0..1 to 0..Res (e.g., 31.99) and center texels
+    float2 xy = uv * res - 0.5; 
+    
+    // 2. Find integer coordinates
+    int x = int(floor(xy.x));
+    int y = int(floor(xy.y));
+    
+    // 3. Calculate weights for interpolation
+    float wx = frac(xy.x);
+    float wy = frac(xy.y);
+    
+    // 4. Clamp to edges to prevent wrapping artifacts
+    int x0 = clamp(x, 0, int(res.x) - 1);
+    int y0 = clamp(y, 0, int(res.y) - 1);
+    int x1 = clamp(x + 1, 0, int(res.x) - 1);
+    int y1 = clamp(y + 1, 0, int(res.y) - 1);
+    
+    // 5. Calculate 1D indices (Row-Major: y * Width + x)
+    // We add zOffset for the 3D texture slicing
+    int idx00 = zOffset + y0 * int(res.x) + x0;
+    int idx10 = zOffset + y0 * int(res.x) + x1;
+    int idx01 = zOffset + y1 * int(res.x) + x0;
+    int idx11 = zOffset + y1 * int(res.x) + x1;
+    
+    // 6. Fetch
+    float3 val00 = buf.Load(idx00).rgb;
+    float3 val10 = buf.Load(idx10).rgb;
+    float3 val01 = buf.Load(idx01).rgb;
+    float3 val11 = buf.Load(idx11).rgb;
+    
+    // 7. Interpolate
+    float3 top = lerp(val00, val10, wx);
+    float3 bot = lerp(val01, val11, wx);
+    return lerp(top, bot, wy);
+}
+float fbm3d(float3 p) {
+    float f = 0.0;
+    f += 0.5000 * noise3D(p);
+    p = p * 2.02;
+    f += 0.2500 * noise3D(p);
+    p = p * 2.03;
+    f += 0.1250 * noise3D(p);
+    return f;
+}
+float3 GetMultiScattering(float3 p, float3 sunDir) {
+    float h = length(p) - R_PLANET;
+    float cosSun = dot(normalize(p), sunDir);
+    
+    // 1. Calculate UVs
+    float u = 0.5 + 0.5 * cosSun;
+    float v = h / (R_ATM - R_PLANET);
+    v = saturate(v);
+
+    // 2. Bilinear Coordinates
+    float width = 32;
+    float height = 32.0;
+    
+    // Convert 0..1 to 0..31 pixel coordinates
+    float x = u * width - 0.5;
+    float y = v * height - 0.5;
+    
+    // Find the 4 nearest pixels (x0, y0) to (x1, y1)
+    int x0 = int(floor(x));
+    int y0 = int(floor(y));
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+    
+    // Calculate weights (how close are we to the next pixel?)
+    float wx = frac(x);
+    float wy = frac(y);
+    
+    // Clamp indices to buffer size (0 to 63)
+    x0 = clamp(x0, 0, 31); x1 = clamp(x1, 0, 31);
+    y0 = clamp(y0, 0, 31); y1 = clamp(y1, 0, 31);
+    
+    // 3. Sample 4 Neighbors
+    float3 val00 = DebugMultiScat.Load(y0 * 32 + x0).rgb; // Top-Left
+    float3 val10 = DebugMultiScat.Load(y0 * 32 + x1).rgb; // Top-Right
+    float3 val01 = DebugMultiScat.Load(y1 * 32 + x0).rgb; // Bottom-Left
+    float3 val11 = DebugMultiScat.Load(y1 * 32 + x1).rgb; // Bottom-Right
+    
+    // 4. Interpolate
+    float3 top = lerp(val00, val10, wx);
+    float3 bot = lerp(val01, val11, wx);
+    return lerp(top, bot, wy);
+}
+float3 GetAerialPerspective(float u, float v, float t) {
+    // 1. Constants (Match your buffer settings)
+    float zRes = 100.0;    // Total Z-slices
+    float width = 32.0;    // Buffer Width
+    float height = 32.0;   // Buffer Height
+
+    // 2. Calculate Z-Slice from Distance (t)
+    // t is in game units. 0.3048 converts to meters. 
+    // 100000.0 is the simulation max height in meters.
+    // We map distance t to a slice index (0 to 99).
+    float zMetric = (t * 0.3048) / 100000.0; 
+    int zSlice = int(clamp(zMetric * (zRes - 1.0), 0.0, zRes - 1.0));
+
+    // 3. Calculate Buffer Offsets
+    // Stride: Each slice is (32*32) pixels * 2 vectors (Even=Scat, Odd=Trans)
+    int sliceOffset = zSlice * (32 * 32) * 2;
+
+    // 4. Bilinear Screen UV Mapping
+    float x = u * width - 0.5;
+    float y = v * height - 0.5;
+
+    // Find nearest integers and clamp to texture bounds (0..31)
+    int x0 = clamp(int(floor(x)), 0, 31);
+    int y0 = clamp(int(floor(y)), 0, 31);
+    int x1 = clamp(x0 + 1, 0, 31);
+    int y1 = clamp(y0 + 1, 0, 31);
+
+    // Calculate fractional weights
+    float wx = frac(x);
+    float wy = frac(y);
+
+    // 5. Fetch In-Scattering Data (Even Indices)
+    // We multiply by 2 because the buffer stores [Scattering, Transmittance] pairs
+    float3 v00 = DebugOpticalDepth.Load(sliceOffset + (y0 * 32 + x0) * 2).rgb;
+    float3 v10 = DebugOpticalDepth.Load(sliceOffset + (y0 * 32 + x1) * 2).rgb;
+    float3 v01 = DebugOpticalDepth.Load(sliceOffset + (y1 * 32 + x0) * 2).rgb;
+    float3 v11 = DebugOpticalDepth.Load(sliceOffset + (y1 * 32 + x1) * 2).rgb;
+
+    // 6. Bilinear Interpolation
+    float3 top = lerp(v00, v10, wx);
+    float3 bot = lerp(v01, v11, wx);
+    float3 inScattering = lerp(top, bot, wy);
+
+    return inScattering;
+}
+float3 GetOpticalPerspective(float u, float v, float t) {
+    // 1. Constants (Match your buffer settings)
+    float zRes = 100.0;    // Total Z-slices
+    float width = 32.0;    // Buffer Width
+    float height = 32.0;   // Buffer Height
+
+    // 2. Calculate Z-Slice from Distance (t)
+    // t is in game units. 0.3048 converts to meters. 
+    // 100000.0 is the simulation max height in meters.
+    // We map distance t to a slice index (0 to 99).
+    float zMetric = (t * 0.3048) / 100000.0; 
+    int zSlice = int(clamp(zMetric * (zRes - 1.0), 0.0, zRes - 1.0));
+
+    // 3. Calculate Buffer Offsets
+    // Stride: Each slice is (32*32) pixels * 2 vectors (Even=Scat, Odd=Trans)
+    int sliceOffset = zSlice * (32 * 32) * 2+1;
+
+    // 4. Bilinear Screen UV Mapping
+    float x = u * width - 0.5;
+    float y = v * height - 0.5;
+
+    // Find nearest integers and clamp to texture bounds (0..31)
+    int x0 = clamp(int(floor(x)), 0, 31);
+    int y0 = clamp(int(floor(y)), 0, 31);
+    int x1 = clamp(x0 + 1, 0, 31);
+    int y1 = clamp(y0 + 1, 0, 31);
+
+    // Calculate fractional weights
+    float wx = frac(x);
+    float wy = frac(y);
+
+    // 5. Fetch In-Scattering Data (Even Indices)
+    // We multiply by 2 because the buffer stores [Scattering, Transmittance] pairs
+    float3 v00 = DebugOpticalDepth.Load(sliceOffset + (y0 * 32 + x0) * 2).rgb;
+    float3 v10 = DebugOpticalDepth.Load(sliceOffset + (y0 * 32 + x1) * 2).rgb;
+    float3 v01 = DebugOpticalDepth.Load(sliceOffset + (y1 * 32 + x0) * 2).rgb;
+    float3 v11 = DebugOpticalDepth.Load(sliceOffset + (y1 * 32 + x1) * 2).rgb;
+
+    // 6. Bilinear Interpolation
+    float3 top = lerp(v00, v10, wx);
+    float3 bot = lerp(v01, v11, wx);
+    float3 inScattering = lerp(top, bot, wy);
+
+    return inScattering;
+}
+float3 GetSunTransmittance(float u_sun, float v_sun) {
+    // 2. Bilinear Coordinates
+    float width = 32.0;
+    float height = 32.0;
+    
+    // Convert 0..1 to 0..31 pixel coordinates
+    float x = u_sun * width - 0.5;
+    float y = v_sun * height - 0.5;
+    
+    // Find the 4 nearest pixels (x0, y0) to (x1, y1)
+    int x0 = int(floor(x));
+    int y0 = int(floor(y));
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+    
+    // Calculate weights (how close are we to the next pixel?)
+    float wx = frac(x);
+    float wy = frac(y);
+    
+    // Clamp indices to buffer size (0 to 63)
+    x0 = clamp(x0, 0, 31.0); x1 = clamp(x1, 0, 31.0);
+    y0 = clamp(y0, 0, 31.0); y1 = clamp(y1, 0, 31.0);
+    
+    // 3. Sample 4 Neighbors
+    float3 val00 = DebugDirect.Load(y0 * 32.0 + x0).rgb; // Top-Left
+    float3 val10 = DebugDirect.Load(y0 * 32.0 + x1).rgb; // Top-Right
+    float3 val01 = DebugDirect.Load(y1 * 32.0 + x0).rgb; // Bottom-Left
+    float3 val11 = DebugDirect.Load(y1 * 32.0 + x1).rgb; // Bottom-Right
+    
+    // 4. Interpolate
+    float3 top = lerp(val00, val10, wx);
+    float3 bot = lerp(val01, val11, wx);
+    return lerp(top, bot, wy);
+}
+
+float PhaseDualLobe(float cosTheta, float g1, float g2, float w) {
+    float p1 = (1.0 - g1 * g1) / pow(max(0.001, 1.0 + g1 * g1 - 2.0 * g1 * cosTheta), 1.5);
+    float p2 = (1.0 - g2 * g2) / pow(max(0.001, 1.0 + g2 * g2 - 2.0 * g2 * cosTheta), 1.5);
+    return (w * p1 + (1.0 - w) * p2);
+}
+
+// --- NEW SPHERICAL INTERSECTION LOGIC ---
+float2 ResolveSphereIntersection(float3 rayOrigin, float3 rayDir, float sphereRadius) {
+    float a = dot(rayDir, rayDir);
+    float b = 2.0 * dot(rayDir, rayOrigin);
+    float c = dot(rayOrigin, rayOrigin) - (sphereRadius * sphereRadius);
+    float d = b * b - 4.0 * a * c;
+
+    if (d < 0.0) return float2(-1.0, -1.0);
+    float sqrtD = sqrt(d);
+    return float2((-b - sqrtD) / (2.0 * a), (-b + sqrtD) / (2.0 * a));
+}
+
+// Replaces IntersectCloudLayer with Shell Logic
+// Handles: Below Clouds, Inside Clouds, Above Clouds (Space)
+float2 IntersectCloudShell(float3 ro, float3 rd, float rInner, float rOuter, float3 planetCenter) {
+    float3 p = ro - planetCenter; // Relative to the moving planet
+    float2 hitOuter = ResolveSphereIntersection(p, rd, rOuter);
+    float2 hitInner = ResolveSphereIntersection(p, rd, rInner);
+
+    if (hitOuter.y < 0) return float2(-1, -1);
+    float tNear = hitOuter.x;
+    float tFar = hitOuter.y;
+
+    if (hitInner.y > 0) {
+        if (hitInner.x > 0) tFar = hitInner.x; // Hit ground looking down
+        else tNear = hitInner.y; // Inside ground looking up
+    }
+    
+    tNear = max(0.0, tNear);
+    if (tFar <= tNear) return float2(-1, -1);
+    return float2(tNear, tFar);
+}
+
+// 2. Density with Mobile Center
+float GetDensity(float3 pos, float cloudBottomAlt, float cloudThickness, float noiseScale, float3 windUV, float3 planetCenter) {
+    // Altitude is calculated relative to the MOBILE center (Curved Floor)
+    float altitude = length(pos - planetCenter) - R_PLANET;
+    
+    // UVs use absolute WORLD position (pos.xz) so textures don't slide when you move!
+    float2 uv = (pos.xz) * noiseScale + windUV.xz; 
+    float noiseVal = fbm(uv);
+    
+    float heightRatio = (altitude - cloudBottomAlt) / (cloudThickness);
+    float heightMask = 4.0 * heightRatio * (1.0 - heightRatio);
+    heightMask = saturate(heightMask);
+    
+    float skib = fbm3d(pos / 1000) * 0.5;
+    return noiseVal * (heightMask - skib * heightMask);
+}
+float GetDensityC(float3 pos, float cloudBottomAlt, float cloudThickness, float noiseScale, float3 windUV, float3 planetCenter) {
+    float altitude = length(pos - planetCenter) - R_PLANET;
+
+    // --- 1. VECTOR FIELD ROTATION (Fixes "1 Direction") ---
+    // Instead of stretching X globally, we rotate the coordinates first.
+    // Sample a very low-frequency noise to determine the "Flow Direction" for this region.
+    float2 largeScalePos = pos.xz * 0.00005; 
+    
+    // Angle varies slowly across the map (0 to 360 degrees)
+    float angle = noise(largeScalePos + windUV.xz * 0.05) * 3.14159 * 2.0; 
+    
+    // Manual Rotation Matrix (Cos, -Sin, Sin, Cos)
+    float s = sin(angle);
+    float c = cos(angle);
+    
+    // Apply Base Scale + Wind
+    float2 uv = pos.xz * noiseScale + windUV.xz * 1.5;
+
+    // ROTATE the UVs so "X" points in the direction of the flow
+    float2 rotatedUV;
+    rotatedUV.x = uv.x * c - uv.y * s;
+    rotatedUV.y = uv.x * s + uv.y * c;
+    uv = rotatedUV;
+
+    // --- 2. DOMAIN WARPING (The "Curl") ---
+    // Distort the UVs before stretching to create "S" shapes and swirls.
+    // We use two different noise offsets for X and Y to break linearity.
+    float2 warp = float2(noise(uv * 0.4), noise(uv * 0.4 + 5.2));
+    uv += warp * 2.0; // Strong warp for curly strands
+
+    // --- 3. ANISOTROPIC STRETCH (The "Streak") ---
+    // Now we stretch the ROTATED X-axis. 
+    // This creates streaks that follow the flow direction calculated in step 1.
+    uv.x *= 0.2; 
+
+    // --- 4. RIDGE NOISE (The "Wispy" Filter) ---
+    // Standard Noise = Puffy Blobs.
+    // Ridge Noise = Thin Veins/Fibrous strands.
+    float noiseVal = fbm(uv/7);
+    
+    // Ridge Math: Turn gradients into sharp creases
+    // (0.5 becomes 1.0, while 0.0 and 1.0 become 0.0)
+    //noiseVal = 1.0 - abs(noiseVal * 2.0 - 1.0);
+    
+    // Sharpen the ridges to make them ultra-thin (Wispy)
+    //noiseVal = pow(noiseVal, 2.5); 
+
+    // --- 5. EROSION & MASK ---
+    // Cut out the faint parts so we only see the core strands
+    noiseVal = smoothstep(0.1, 0.6, noiseVal);
+    
+    // Triangle Height Fade (same as before)
+    float heightRatio = (altitude - cloudBottomAlt) / cloudThickness;
+    float heightMask = 1.0 - abs(heightRatio * 2.0 - 1.0); 
+    heightMask = pow(saturate(heightMask), 0.5);
+    
+    // Final composite
+    return noiseVal * heightMask * 0.8; 
+}
+
+// 3. Density Wrapper
+float GetDensity2(float3 pos, float cloudBottomAlt, float cloudThickness, float noiseScale, float3 windUV, float3 planetCenter,float cover) {
+    float density = 0;
+    float threshold = 1.0 - cover;
+    float altitude = length(pos - planetCenter) - R_PLANET;
+    
+    if (altitude >= CUMULUS_BOT && altitude <= CUMULUS_TOP) {
+        density += smoothstep(threshold, threshold + 0.15, GetDensity(pos, CUMULUS_BOT, CUMULUS_TOP - CUMULUS_BOT, noiseScale, windUV, planetCenter))*4;
+    }
+    if (altitude >= CIRRUS_BOT && altitude <= CIRRUS_TOP) {
+        density += smoothstep(threshold, threshold+0.15,GetDensityC(pos, CIRRUS_BOT, CIRRUS_TOP - CIRRUS_BOT, noiseScale*2, windUV, planetCenter)*fbm(pos.xz*noiseScale+windUV))*0.5;
+
+	
+    }
+    return density;
+}
+
+
+
+float InterleavedGradientNoise(float2 uv) {
+    float3 magic = float3(0.06711056, 0.00583715, 52.9829189);
+    return frac(magic.z * frac(dot(uv, magic.xy)));
+}
+
+void main(
+    float4 v0 : SV_Position0,
+    out float4 o0 : SV_Target0,
+    out float oDepth : SV_Depth)
+{
+    	CameraInjection[0] = CB0.ViewDir;
+    	CameraInjection[1] = float4(CB0.CameraPosition[0], 1.0);
+    	CameraInjection[2] = CB0.ViewRight;
+    	CameraInjection[3] = CB0.ViewUp;
+    	// NEW: Inject Sun and FoV Data
+    	CameraInjection[4] = float4(CB0.Lamp0Dir, 0); 
+    	CameraInjection[5] = float4(CB0.Lamp0Color, 0);
+    	CameraInjection[6] = CB4.FoV; // Contains FoV scales
+ 
+    float DEPTH_CONTROL = 0.1;
+    float2 screenUV = v0.xy * CB0.invViewportWH;
+    int3 pixelCoord = int3(v0.xy, 0);
+    float Bob = TimeBuffer.Load(0); 
+    float hwDepth = GlobalDepth.Sample(CloudsSampler_s, screenUV*1).x;
+    float3 baseColor = Color.Sample(CloudsSampler_s, screenUV*1).xyz;
+    // Linearize Depth: Distance = 0.1 / Depth
+    float sceneDepth = DEPTH_CONTROL / (hwDepth+0.0000000001);
+    // Reconstruct Ray
+    float4 r0;
+    float3 r1;
+    r0.xy = float2(0.5, 0.5) * v0.xy;
+    r0.xy = r0.xy / CB0.viewportScale.xy;
+    r0.zw = r0.xy * CB4.FoV.xy + float2(-1, -1);
+    r0.zw = CB4.FoV.zw * r0.zw + CB4.shearOffset.xy;
+    r1.xyz = CB0.ViewUp.xyz * r0.www;
+    r1.xyz = r0.zzz * CB0.ViewRight.xyz + -r1.xyz;
+    r1.xyz = -CB0.ViewDir.xyz + r1.xyz;
+    float3 rayDir = normalize(r1);
+    float3 camPos = CB0.CameraPosition[0].xyz;
+    
+    float3 viewForward = normalize(CB0.ViewDir.xyz);
+    float viewCosTheta = abs(dot(rayDir, viewForward));
+    // Config
+    float cloudBottomAlt = 6000;
+    float cloudTopAlt = (30000);
+    float cloudThickness = cloudTopAlt - cloudBottomAlt;
+    float4 cloudColor = float4(1.0, 1.0, 1.0, 1.0);
+    float coverage = CB5.CoverDensityQuality.x > 0.0 ?
+        CB5.CoverDensityQuality.x : 0.45;
+    
+    // --- CALCULATE INTERSECTION WITH SPHERICAL SHELL ---
+    float rInner = R_PLANET + cloudBottomAlt;
+    float rOuter = R_PLANET + cloudTopAlt;
+    float3 mobileCenter = float3(camPos.x, PLANET_CENTER.y, camPos.z);
+    
+    float2 intersection = IntersectCloudShell(camPos, rayDir, rInner, rOuter, mobileCenter);
+    // 1. Get distance to nearest boundary for fade
+    // Note: Simple approximation using altitude for fading
+    float camAlt = length(camPos - PLANET_CENTER) - R_PLANET;
+    float distToLayer = min(abs(camAlt - cloudTopAlt), abs(camAlt - cloudBottomAlt));
+    float fadeFactor = saturate(distToLayer / 400);
+
+    float tNear = intersection.x;
+    float tFar = intersection.y;
+    
+    // Dithering
+    float ditherVal = InterleavedGradientNoise(v0.xy);
+    // Add jitter to end distance
+    // Be careful not to jitter into valid geometry
+    if (tFar > 0) tFar += 500 * ditherVal;
+    float3 finalColor = float3(0, 0, 0);
+    float finalAlpha = 0.0;
+    float tcul = 0;
+
+    float outputLinearDepth = sceneDepth;
+    bool depthCaptured = false;
+    float3 sunDir;
+    float sunH = -1;
+    float sunmult = 1;
+    bool hit=false;
+    sunDir = -normalize(CB0.Lamp0Dir.xyz);
+        float3 sunColor = CB0.Lamp0Color.xyz;
+        
+        // --- MOON DETECTION LOGIC ---
+        float lampBrightness = length(sunColor);
+        bool isMoon = (sunDir.y > 0.2) && (lampBrightness < 2.0);
+        if (isMoon) {
+            sunColor = float3(0.0, 0.0, 0.0);
+        }
+
+        float3 baseAmbColor = CB0.AmbientColor.xyz * 5.0;
+        // --- SUNSET & NIGHT COLOR GRADING ---
+        if (!isMoon) {
+            sunH = sunDir.y;
+            float3 dayTint = float3(1.0, 1.0, 1.0);
+            float3 goldTint = float3(1.0, 0.8, 0.5);
+            float3 redTint = float3(1.0, 0.4, 0.1);
+            float3 currentTint = dayTint;
+            if (sunH < 0.3) {
+                float t = smoothstep(0.0, 0.3, sunH);
+                if (sunH < 0.15) {
+                    currentTint = lerp(redTint, goldTint, smoothstep(-0.1, 0.15, sunH));
+                } else {
+                    currentTint = lerp(goldTint, dayTint, smoothstep(0.15, 0.3, sunH));
+                }
+                float extinction = smoothstep(-0.1, 0.2, sunH);
+                sunColor *= currentTint * extinction;
+            }
+
+            //float3 nightAmb = float3(0.10, 0.13, 0.2);
+            //float3 sunsetAmb = float3(0.5, 0.3, 0.2);
+
+            if (sunH < 0.2) {
+                //float tAmb = smoothstep(-0.05, 0.2, sunH);
+                //float3 horizonAmb = lerp(nightAmb, sunsetAmb, smoothstep(-0.05, 0.1, sunH));
+                //baseAmbColor = lerp(horizonAmb, baseAmbColor, tAmb);
+            }
+            if (sunH < -0.2) {
+                sunmult = 0;
+                sunDir = -sunDir;
+            }
+        } else {
+            //baseAmbColor = float3(0.10, 0.13, 0.2) * 1.2;
+ 	    sunmult = 0;
+        }
+    // Render only if we hit the volume
+    if (intersection.x != -1.0 && tFar > tNear)
+    {
+        int steps = 300;
+        float maxDist = 400000.0;
+        float t = tNear;
+
+        float marchStep = 500; 
+        t += marchStep * ditherVal;
+        float3 accumulatedColor = float3(0, 0, 0);
+        float transmittance = 1.0;
+
+        float noiseScale = 0.0001;
+        float3 windUV = Bob/100;
+        
+
+        float cosTheta = dot(rayDir, sunDir);
+        float phaseVal = PhaseDualLobe(cosTheta, 0.5, -0.3, 0.7)+0.15;
+        float accdense = 0;
+        
+        [loop]
+        for (int i = 0; i < steps; i++)
+        {
+            tcul = t;
+            if (transmittance < 0.001) break;
+            if (t > tFar || t > maxDist) break;
+            // Depth Occlusion
+            float radialSceneDepth = sceneDepth / viewCosTheta;
+            if (t > radialSceneDepth) {
+               break;
+            }
+
+            float3 currentPos = camPos + rayDir * t;
+	    float currentAlt = length(currentPos - mobileCenter) - R_PLANET;
+            
+            // GAP LOGIC: We are between Cumulus (Top 15km) and Cirrus (Bottom 24km)
+            if (currentAlt > CUMULUS_TOP + 100.0 && currentAlt < CIRRUS_BOT - 100.0) {
+                
+                // 1. Check hit against Cirrus Bottom (Above us, 24km)
+                // We are INSIDE this sphere, so .y is the forward intersection
+                float2 hitCirrus = ResolveSphereIntersection(camPos - mobileCenter, rayDir, R_PLANET + CIRRUS_BOT);
+                float distToCirrus = hitCirrus.y;
+
+                // 2. Check hit against Cumulus Top (Below us, 15km)
+                // We are OUTSIDE this sphere, so .x is the first intersection (Entry)
+                float2 hitCumulus = ResolveSphereIntersection(camPos - mobileCenter, rayDir, R_PLANET + CUMULUS_TOP);
+                float distToCumulus = hitCumulus.x;
+
+                float jumpTarget = 1e9;
+                bool shouldJump = false;
+
+                // If looking UP, we hit Cirrus
+                if (distToCirrus > t) {
+                    jumpTarget = distToCirrus;
+                    shouldJump = true;
+                }
+
+                // If looking DOWN, we hit Cumulus (and it's closer than Cirrus on the other side of the world)
+                // Note: hitCumulus.x is -1 if we miss the sphere (looking purely up)
+                if (hitCumulus.x > 0.0 && distToCumulus > t) {
+                    if (distToCumulus < jumpTarget) {
+                        jumpTarget = distToCumulus;
+                        shouldJump = true;
+                    }
+                }
+
+                if (shouldJump) {
+                    t = jumpTarget;
+                    // Dither the landing to hide the seam
+                    t += marchStep * ditherVal; 
+                    continue; 
+                }
+            }
+            float rawDensity = GetDensity2(currentPos, cloudBottomAlt, cloudThickness, noiseScale, windUV,float3(camPos.x,PLANET_CENTER.y,camPos.z),coverage);
+            float threshold = 1.0 - coverage;
+            float density = rawDensity;
+            density *= (CB5.CoverDensityQuality.y > 0.0 ? CB5.CoverDensityQuality.y : 0.4) * 10.0;
+            if (density > 0.01)
+            {
+		hit = true;
+                if (!depthCaptured) {
+                    outputLinearDepth = t * viewCosTheta;
+                    depthCaptured = true;
+                }
+
+                float lightTransmittance = 1.0;
+                float3 lightPos = currentPos;
+                float shadowStep = marchStep * 0.5;
+                [unroll]
+                for (int j = 0; j < 6; j++) {
+                    lightPos += sunDir * shadowStep;
+                    // Shadow check also uses Spherical Density
+                    float ld = GetDensity2(lightPos, cloudBottomAlt, cloudThickness, noiseScale, windUV,float3(camPos.x,PLANET_CENTER.y,camPos.z),coverage);
+                    float lDens = ld;
+                    lightTransmittance *= exp(-lDens * 0.5);
+                    shadowStep *= 1.5;
+                }
+
+                float powder = 1.0 - exp(-density * 4.0);
+		powder = clamp(powder,0.8,1);
+                // Height Ratio for ambient (Approximated spherically)
+                // Height Ratio for ambient (Approximated spherically)
+                // FIX: Use mobileCenter so altitude is correct even at X=100,000
+                float currAlt = length(currentPos - mobileCenter) - R_PLANET;
+                float heightRatio = saturate((currAlt - cloudBottomAlt) / cloudThickness);
+                
+                float adjustval = lerp(1,10,smoothstep(sunH,-0.1,0.0));
+                
+		float3 localUp = normalize(currentPos - mobileCenter);
+                float cosSun = dot(localUp, sunDir);
+                float u_sun = cosSun * 0.5 + 0.5;
+
+
+
+                // FIX: Use mobileCenter for Ambient Lookup
+                // If we use PLANET_CENTER, the lookup thinks we are in outer space!
+                float3 ambient = (GetMultiScattering(currentPos - mobileCenter, sunDir)*1.5);
+                float cloudAltitude = (length(currentPos-mobileCenter) -  R_PLANET)/SCALE_FACTOR;
+                float v_alt = (cloudAltitude) / 20000;
+		float3 suntrans = GetSunTransmittance(u_sun,v_alt);
+                float3 direct = suntrans*sunmult*lightTransmittance*powder * phaseVal;//sunColor * lightTransmittance * powder * phaseVal * 1.5/3.0;
+                float3 totalLight = direct + ambient*sunmult*float3(1.2,0.9,0.7)*(3+powder)/4 + float3(0.07,0.07,0.12)*(3+powder)/4;
+                float4 sampledSkyColor = SkyColor.Sample(CloudsSampler_s, screenUV*1);
+                float3 cloudAlbedo = lerp(totalLight * cloudColor.xyz,sampledSkyColor.xyz,t/400000);
+
+                float stepDensity = density * marchStep * 0.01;
+                accdense += stepDensity;
+                float stepTransmittance = exp(-stepDensity);
+
+                accumulatedColor += cloudAlbedo * (transmittance - transmittance * stepTransmittance);
+                transmittance *= stepTransmittance;
+            }
+
+            t += marchStep;
+            marchStep *= 1.005;
+        }
+        finalAlpha = 1-transmittance;
+        finalColor = accumulatedColor;
+    }
+
+    if (finalAlpha < 0.001) {
+        //discard;
+    }
+
+    // --- FIX START: Horizon Color Simulation & Distance Fog ---
+
+    float3 horzNight  = float3(0.02, 0.04, 0.10);
+    float3 horzSunset = float3(0.80, 0.50, 0.20)/1.2;
+    float3 horzDay    = float3(0.70, 0.85, 1.00);
+
+    float3 targetFogColor;
+
+    if (sunH < 0.0) {
+        float t = smoothstep(-0.2, 0.0, sunH);
+        targetFogColor = lerp(horzNight, horzSunset, t);
+    } else {
+        float t = smoothstep(0.0, 0.2, sunH);
+        targetFogColor = lerp(horzSunset, horzDay, t);
+    }
+    bool isSky = sceneDepth/viewCosTheta > 400000.0; // Threshold: 100km
+    float3 aerialFog = GetAerialPerspective(screenUV.x, screenUV.y, outputLinearDepth/viewCosTheta)*sunmult;
+    float3 rawCloudColor = finalColor/ max(finalAlpha, 0.0001);
+    float3 cloudabs = GetOpticalPerspective(screenUV.x, screenUV.y, outputLinearDepth/viewCosTheta);
+    finalColor = rawCloudColor*cloudabs +aerialFog;
+    //float fogFactor = saturate(tcul*length(rayDir.xy)*10 / 100000);
+
+    float4 sampledSkyColor = SkyColor.Sample(CloudsSampler_s, screenUV*1);
+    float exposure = max(0.2, CB0.Exposure_DoFDistance.y);
+    float3 ggcol = finalColor * (exposure/2);
+    ggcol = ggcol/(1.0+ggcol);
+    if (debug ==0) {
+	o0.xyz = finalColor;
+    	o0.w = finalAlpha;
+    }
+    else if (debug==2) {
+	if (!isSky) {
+		float3 composite = baseColor * (1.0 - finalAlpha);
+		o0.xyz = (composite * cloudabs + aerialFog )*(1-finalAlpha)+(rawCloudColor*cloudabs+aerialFog)*finalAlpha;
+ 		o0.w = 1.0;
+	}
+	else {
+		if (hit) {
+			o0.xyz  = (rawCloudColor*cloudabs+aerialFog)*finalAlpha+baseColor*(1.0-finalAlpha);
+			o0.w =1.0;
+		}
+		else {
+			o0.xyz = baseColor;
+			o0.w =1.0;
+		}
+	}
+    }
+    else {
+	o0.xyz = clamp(log(outputLinearDepth)/(50*log(2)),0,0.9);
+    }
+    // --- FIX END ---
+ 
+    // --- DEBUG PLOT: BUFFERS ---
+    
+    // 1. Plot MultiScat (Left Side)
+   
+    if (debug == 1) {
+        float bufferRes = 32.0; // The resolution of your buffers
+        
+        // 1. Plot MultiScat (Left: x < 256)
+        if (v0.x < 256 && v0.y < 256) {
+            // Map Screen 0..256 to UV 0..1
+            float2 uv = v0.xy / 256.0;
+            
+            float3 debugVal = SampleBilinear(DebugMultiScat, uv, float2(bufferRes, bufferRes), 0);
+            o0.xyz = debugVal; 
+            o0.w = 1.0;
+        }
+        
+        // 2. Plot Optical Depth 3D Slice (Middle: 256 < x < 512)
+        // 2. Plot Optical Depth 3D Slice (Middle: 256 < x < 512)
+        else if (v0.x >= 256 && v0.x < 512 && v0.y < 256) {
+            // Map Screen 256..512 to UV 0..1
+            float2 uv = float2((v0.x - 256.0) / 256.0, v0.y / 256.0);
+            
+            // --- SLICE SELECTION VIA DENSITY SLIDER ---
+            // Use Density Slider (CoverDensityQuality.x) to pick Z-Slice (0 to 31)
+            float sliderVal = saturate(CB5.CoverDensityQuality.x);
+            // Default to middle slice if slider is untouched/zero
+            float zRes = 100.0;
+            if (sliderVal < 0.001) sliderVal = 0.5;
+            
+            int zSlice = int(sliderVal * (zRes - 1.0));
+            zSlice = clamp(zSlice, 0, int(zRes) - 1);
+            // ------------------------------------------
+
+            float width = bufferRes;
+            float height = bufferRes; 
+            
+            float x = uv.x * width - 0.5;
+            float y = uv.y * height - 0.5;
+            int x0 = clamp(int(floor(x)), 0, 31);
+            int y0 = clamp(int(floor(y)), 0, 31);
+            int x1 = clamp(x0 + 1, 0, 31);
+            int y1 = clamp(y0 + 1, 0, 31);
+            
+            float wx = frac(x); 
+            float wy = frac(y);
+            
+            // --- STRIDE CORRECTION ---
+            // Data Layout: [Scat, Trans, Scat, Trans...]
+            // Stride per slice = (Width * Height) * 2 vectors
+            // Stride per pixel = 2 vectors
+            int sliceOffset = zSlice * (32 * 32) * 2;
+            
+            // Read In-Scattering (Even Indices)
+            float3 v00 = DebugOpticalDepth.Load(sliceOffset + (y0 * 32 + x0) * 2).rgb;
+            float3 v10 = DebugOpticalDepth.Load(sliceOffset + (y0 * 32 + x1) * 2).rgb;
+            float3 v01 = DebugOpticalDepth.Load(sliceOffset + (y1 * 32 + x0) * 2).rgb;
+            float3 v11 = DebugOpticalDepth.Load(sliceOffset + (y1 * 32 + x1) * 2).rgb;
+            
+            float3 top = lerp(v00, v10, wx);
+            float3 bot = lerp(v01, v11, wx);
+            float3 debugVal = lerp(top, bot, wy);
+
+            // Simple Exposure for Visualization
+            o0.xyz = 1.0 - exp(-debugVal * 1.0);
+            o0.w = 1.0;
+        }
+	else if (v0.x >= 256 && v0.x < 512 && v0.y >= 256 && v0.y < 512) {
+            // Map Screen 256..512 to UV 0..1
+            float2 uv = float2((v0.x - 256.0) / 256.0, (v0.y-256.0) / 256.0);
+            
+            // --- SLICE SELECTION VIA DENSITY SLIDER ---
+            // Use Density Slider (CoverDensityQuality.x) to pick Z-Slice (0 to 31)
+            float sliderVal = saturate(CB5.CoverDensityQuality.x);
+            // Default to middle slice if slider is untouched/zero
+            float zRes = 100.0;
+            if (sliderVal < 0.001) sliderVal = 0.5;
+            
+            int zSlice = int(sliderVal * (zRes - 1.0));
+            zSlice = clamp(zSlice, 0, int(zRes) - 1);
+            // ------------------------------------------
+
+            float width = bufferRes;
+            float height = bufferRes; 
+            
+            float x = uv.x * width - 0.5;
+            float y = uv.y * height - 0.5;
+            int x0 = clamp(int(floor(x)), 0, 31);
+            int y0 = clamp(int(floor(y)), 0, 31);
+            int x1 = clamp(x0 + 1, 0, 31);
+            int y1 = clamp(y0 + 1, 0, 31);
+            
+            float wx = frac(x); 
+            float wy = frac(y);
+            
+            // --- STRIDE CORRECTION ---
+            // Data Layout: [Scat, Trans, Scat, Trans...]
+            // Stride per slice = (Width * Height) * 2 vectors
+            // Stride per pixel = 2 vectors
+            int sliceOffset = zSlice * (32 * 32) * 2 + 1;
+            
+            // Read In-Scattering (Even Indices)
+            float3 v00 = DebugOpticalDepth.Load(sliceOffset + (y0 * 32 + x0) * 2).rgb;
+            float3 v10 = DebugOpticalDepth.Load(sliceOffset + (y0 * 32 + x1) * 2).rgb;
+            float3 v01 = DebugOpticalDepth.Load(sliceOffset + (y1 * 32 + x0) * 2).rgb;
+            float3 v11 = DebugOpticalDepth.Load(sliceOffset + (y1 * 32 + x1) * 2).rgb;
+            
+            float3 top = lerp(v00, v10, wx);
+            float3 bot = lerp(v01, v11, wx);
+            float3 debugVal = lerp(top, bot, wy);
+
+            // Simple Exposure for Visualization
+            o0.xyz = debugVal;
+            o0.w = 1.0;
+        }
+        
+        // 3. Plot Direct Light (Right: 512 < x < 768)
+        else if (v0.x >= 512 && v0.x < 768 && v0.y < 256) {
+             // Map Screen 512..768 to UV 0..1
+            float2 uv = float2((v0.x - 512.0) / 256.0, v0.y / 256.0);
+            
+            float3 debugVal = SampleBilinear(DebugDirect, uv, float2(bufferRes, bufferRes), 0);
+            
+            // Direct Light is usually 0..1 (Transmittance), so we display raw
+            o0.xyz = debugVal;
+            o0.w = 1.0;
+        }
+    }
+    // ------------------------------------
+    // Convert Linear Depth back to Buffer Depth
+    oDepth = DEPTH_CONTROL / (outputLinearDepth + 0.000001);
+    if (debug==2) {
+	oDepth =1.0;
+    }
+}
